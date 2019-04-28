@@ -1,10 +1,12 @@
 USE [master]
 GO
-/****** Object:  StoredProcedure [dbo].[getcount]    Script Date: 19.12.2016 16:43:28 ******/
+/****** Object:  StoredProcedure [dbo].[getcount]    Script Date: 4/28/2019 11:27:25 AM ******/
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
 GO
+
+
 -- =============================================
 -- Author:		korobov
 -- Create date: 
@@ -21,28 +23,42 @@ BEGIN
 	declare @name_where nvarchar(max)='t.name like '''+@name+''''
 	declare @schema_where nvarchar(max)='sh.name like '''+@sh+''''
 	
-	declare @precommand nvarchar(max) = 'if OBJECT_ID(''tempdb..##t_count'') is not null drop table ##t_count create table ##t_count(db nvarchar(max),sh nvarchar(max),tname nvarchar(max),reserved_kb int,index_size_kb int,rows int)'
+	declare @precommand nvarchar(max) = 'if OBJECT_ID(''tempdb..##t_count'') is not null drop table ##t_count create table ##t_count(db nvarchar(max),sh nvarchar(max),tname nvarchar(max),reserved_kb int,index_size_kb int,rows int,data int,unused int)'
 	
-	declare @q1_insert nvarchar(max) = 'insert into ##t_count(db,sh,tname,reserved_kb,index_size_kb,rows)';
-	declare @q2_select nvarchar(max) = 'SELECT ''[?]'',sh=sh.name,t=t.name, --ss.object_id,
-	reserved_kb=SUM (ss.reserved_page_count) +isnull(part.reserved_page_count,0) , --@reservedpages
-	index_size_kb =((CASE WHEN SUM (ss.used_page_count)+isnull(part.used_page_count,0) > SUM (
-		CASE
-			WHEN (index_id < 2) THEN (in_row_data_page_count + lob_used_page_count + row_overflow_used_page_count)
-			ELSE lob_used_page_count + row_overflow_used_page_count
-		END
-		) THEN (SUM (ss.used_page_count)+isnull(part.used_page_count,0) - SUM (
-		CASE
-			WHEN (index_id < 2) THEN (in_row_data_page_count + lob_used_page_count + row_overflow_used_page_count)
-			ELSE lob_used_page_count + row_overflow_used_page_count
-		END
-		)) ELSE 0 END) * 8),
-	rows=SUM (
-		CASE
-			WHEN (index_id < 2) THEN row_count
-			ELSE 0
-		END
-		)';
+	declare @q1_insert nvarchar(max) = 'insert into ##t_count(db,sh,tname,reserved_kb,index_size_kb,rows,data,unused)';
+	declare @q2_select nvarchar(max) = 'SELECT
+			''[?]'',
+			[schemaname] = a3.name,
+			[tablename] = a2.name,
+			reserved = (a1.reserved + ISNULL(a4.reserved,0))* 8,
+			index_size = (CASE WHEN (a1.used + ISNULL(a4.used,0)) > a1.data THEN (a1.used + ISNULL(a4.used,0)) - a1.data ELSE 0 END) * 8,
+			row_count = a1.rows,
+			data = a1.data * 8,
+			unused = (CASE WHEN (a1.reserved + ISNULL(a4.reserved,0)) > a1.used THEN (a1.reserved + ISNULL(a4.reserved,0)) - a1.used ELSE 0 END) * 8
+	FROM
+			(SELECT
+				ps.object_id,
+				[rows] = SUM (CASE WHEN (ps.index_id < 2) THEN row_count ELSE 0 END),
+				reserved = SUM (ps.reserved_page_count),
+				data = SUM (CASE WHEN (ps.index_id < 2) THEN (ps.in_row_data_page_count + ps.lob_used_page_count + ps.row_overflow_used_page_count)
+								ELSE (ps.lob_used_page_count + ps.row_overflow_used_page_count)
+							END),
+				used = SUM (ps.used_page_count)
+				FROM [?].sys.dm_db_partition_stats ps
+			GROUP BY ps.object_id) AS a1
+				LEFT JOIN
+					(SELECT
+						it.parent_id,
+						reserved = SUM(ps.reserved_page_count),
+						used = SUM(ps.used_page_count)
+						FROM [?].sys.dm_db_partition_stats ps
+					JOIN [?].sys.internal_tables it ON it.object_id = ps.object_id
+					WHERE it.internal_type IN (202,204)
+					GROUP BY it.parent_id) 
+				AS a4 ON a4.parent_id = a1.object_id
+			JOIN [?].sys.all_objects a2  ON a1.object_id = a2.object_id 
+			JOIN [?].sys.schemas a3 ON a2.schema_id = a3.schema_id			
+		';
 	declare @q_from1 nvarchar(max) = 'SELECT it.parent_id,reserved_page_count = sum(reserved_page_count),used_page_count = sum(used_page_count)
 										FROM [?].sys.dm_db_partition_stats p, sys.internal_tables it
 										WHERE it.internal_type IN (202,204,211,212,213,214,215,216) AND p.object_id = it.object_id
@@ -50,16 +66,16 @@ BEGIN
 	declare @q3_from nvarchar(max) = 'FROM [?].sys.dm_db_partition_stats ss join [?].sys.tables t on t.object_id=ss.object_id
 								  join [?].sys.schemas sh on sh.schema_id = t.schema_id
 								  left join ('+@q_from1+') part on part.parent_id = ss.object_id'
-	declare @q4_group nvarchar(max) = 'group by sh.name,t.name,ss.object_id,part.reserved_page_count,part.used_page_count'
+	
 	
 	declare @where1 nvarchar(max) = coalesce(@name_where + 'and '+@schema_where ,@name_where,@schema_where);
-	declare @where nvarchar(max) = isnull(' where ' + @where1,'');
+	declare @where nvarchar(max) = 'WHERE a2.type <> N''S'' and a2.type <> N''IT'''+  isnull(' AND ' + @where1,'');
 
 	--declare @tab nvarchar(max) = ',[query]=case when [type] = ''USER_TABLE'' then ''select top 100 * from ''+db+''.[''+sh+''].[''+name+'']'' else null end'	
-	declare @postcommand nvarchar(max) =  'select * from ##t_count order by db,sh,tname,rows'
+	declare @postcommand nvarchar(max) =  'select db,sh,tname,reserved_kb,index_size_kb,data,unused,rows from ##t_count order by db,sh,tname,rows'
 
-	declare  @q nvarchar(max) =  @q1_insert +' '+ @q2_select +' '+ @q3_from +' '+@where+' '+ @q4_group
-
+	declare  @q nvarchar(max) =  @q1_insert +' '+ @q2_select +' '+@where
+	--print(@q)
 	if @db is not null and @db != ''
 	begin
 		if not exists (select 1 from sys.databases where name like @db)
@@ -78,9 +94,5 @@ BEGIN
 
 	exec sp_msforeachdb @precommand = @precommand, @command1=@q ,@postcommand = @postcommand
 
+	PRINT @postcommand
 END
-
---exec [dbo].[getcount] @db = 'kdb_test' @type = 'USER_TABLE',@name='%l%'
-
---exec [dbo].[getcount] @db = 'kdb_test',@name = '%Engagement%'
-
